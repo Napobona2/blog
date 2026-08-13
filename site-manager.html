@@ -942,10 +942,11 @@ function ensureLinkedListForRow(row){
 /* "Posts" on a root (main category) entry opens that category's
    subcategory list here in the Lists tab — same card-grid layout as any
    other list's entries, just scoped to that one subcategory's posts. */
-function viewPostsForRow(row){
+async function viewPostsForRow(row){
   const match = ensureLinkedListForRow(row);
   if(!match) return;
   currentListId = match[0];
+  await autoLoadListCsv(currentListId);
   refreshListSelect();
   loadListIntoForm();
   switchTab('lists');
@@ -962,7 +963,7 @@ const csvHandles = new Map();   // listId -> FileSystemFileHandle
 const pageHandles = new Map();  // listId -> FileSystemFileHandle
 let postHtmlHandle = null;
 let currentPostRow = null; // row object already added to a list's entries for this post draft, if any
-const postContentCache = new Map(); // row -> { heroFile, blocks: [...] } — full editable content, cached on save (this session only)
+const postContentCache = new Map(); // row -> { heroFile, blocks: [...] } — in-memory fast path; loadPostBlocksFromDisk() is the real fallback
 const postHandleCache = new Map();  // row -> FileSystemFileHandle for that post's saved file
 
 /* Linking the project's root folder once lets every save write straight to
@@ -971,12 +972,48 @@ const postHandleCache = new Map();  // row -> FileSystemFileHandle for that post
      <root>/subcat/<page>.html, <root>/subcat/<page>-projects.csv
      <root>/subcat/posts/<post>.html
      <root>/subcat/posts/models/<model files>
-   This lasts for the current browser tab only — reloading clears it, same
-   as the individual file handles below. */
+   The handle itself is remembered in IndexedDB across restarts (browsers
+   allow storing FileSystemHandle objects there, unlike localStorage). A
+   restart still requires one click to re-grant permission — that's a
+   browser security boundary, not something a page can skip — but it's a
+   single click on the remembered folder, not picking it again from scratch. */
 let projectDirHandle = null;
 let subcatDirHandle = null;
 let postsDirHandle = null;
 let modelsDirHandle = null;
+let pendingFolderHandle = null; // a remembered handle from IndexedDB that still needs permission re-granted
+
+/* ---------- IndexedDB: persists the folder handle itself across restarts ---------- */
+
+const IDB_NAME = 'siteManagerHandles';
+const IDB_STORE = 'handles';
+
+function idbOpen(){
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbSet(key, value){
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbGet(key){
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
 
 async function verifyDirPermission(handle){
   const opts = { mode: 'readwrite' };
@@ -987,35 +1024,206 @@ async function verifyDirPermission(handle){
 
 function updateProjectFolderStatus(){
   const el = document.getElementById('projectFolderStatus');
+  const btn = document.getElementById('linkFolderBtn');
   if(!el) return;
   if(!DIR_SUPPORTED){
     el.textContent = "Your browser doesn't support linking a folder — saves will ask you to choose each file's location individually.";
+    if(btn) btn.hidden = true;
     return;
   }
-  el.textContent = projectDirHandle
-    ? ('Linked: ' + projectDirHandle.name + '  (root · subcat/ · subcat/posts/ · subcat/posts/models/)')
-    : "Not linked — saves will ask you to choose each file's location individually.";
+  if(btn) btn.hidden = false;
+  if(projectDirHandle){
+    el.textContent = 'Linked: ' + projectDirHandle.name + '  (root · subcat/ · subcat/posts/ · subcat/posts/models/)';
+    if(btn) btn.textContent = 'Change project folder…';
+  } else if(pendingFolderHandle){
+    el.textContent = 'Remembered folder "' + pendingFolderHandle.name + '" — needs permission re-granted after the restart.';
+    if(btn) btn.textContent = 'Reconnect project folder';
+  } else {
+    el.textContent = "Not linked — saves will ask you to choose each file's location individually.";
+    if(btn) btn.textContent = 'Link project folder…';
+  }
+}
+
+async function connectProjectFolder(handle){
+  projectDirHandle = handle;
+  subcatDirHandle = await projectDirHandle.getDirectoryHandle('subcat', { create: true });
+  postsDirHandle = await subcatDirHandle.getDirectoryHandle('posts', { create: true });
+  modelsDirHandle = await postsDirHandle.getDirectoryHandle('models', { create: true });
+  pendingFolderHandle = null;
+  updateProjectFolderStatus();
+  updateListSaveStatus();
+  updatePostSaveStatus();
+  await autoLoadRootCsv();
 }
 
 async function linkProjectFolder(){
   if(!DIR_SUPPORTED){ alert("Your browser doesn't support linking a folder. Chrome or Edge are needed for this — saves will fall back to individual file dialogs."); return; }
   try{
-    const handle = await window.showDirectoryPicker();
-    if(!(await verifyDirPermission(handle))){ alert('Permission to write to that folder was not granted.'); return; }
-    projectDirHandle = handle;
-    subcatDirHandle = await projectDirHandle.getDirectoryHandle('subcat', { create: true });
-    postsDirHandle = await subcatDirHandle.getDirectoryHandle('posts', { create: true });
-    modelsDirHandle = await postsDirHandle.getDirectoryHandle('models', { create: true });
-    updateProjectFolderStatus();
-    updateListSaveStatus();
-    updatePostSaveStatus();
-    note('project folder linked: ' + handle.name);
+    let handle;
+    if(pendingFolderHandle){
+      // Reconnecting a remembered folder only needs permission re-granted — no picker, no re-browsing.
+      const perm = await pendingFolderHandle.requestPermission({ mode: 'readwrite' });
+      if(perm !== 'granted'){ alert('Permission was not granted.'); return; }
+      handle = pendingFolderHandle;
+    } else {
+      handle = await window.showDirectoryPicker();
+      if(!(await verifyDirPermission(handle))){ alert('Permission to write to that folder was not granted.'); return; }
+    }
+    await connectProjectFolder(handle);
+    await idbSet('projectDir', handle);
+    note((pendingFolderHandle ? 'project folder reconnected: ' : 'project folder linked: ') + handle.name);
   } catch(err){
     if(err.name !== 'AbortError') alert('Could not link folder: ' + err.message);
   }
 }
 
+async function tryReconnectProjectFolder(){
+  if(!DIR_SUPPORTED) return;
+  try{
+    const handle = await idbGet('projectDir');
+    if(!handle) return;
+    const perm = await handle.queryPermission({ mode: 'readwrite' });
+    if(perm === 'granted'){
+      await connectProjectFolder(handle);
+      note('project folder reconnected: ' + handle.name);
+    } else {
+      pendingFolderHandle = handle;
+      updateProjectFolderStatus();
+    }
+  } catch(e){ /* stored handle may point at a folder that no longer exists, or IndexedDB unavailable — fine, just stay unlinked */ }
+}
+
 document.getElementById('linkFolderBtn').addEventListener('click', linkProjectFolder);
+
+/* ---------- Auto-load real data from disk once the folder is linked ---------- */
+
+function rowsFromCsvText(text){
+  return parseCSV(text).map((r, i) => ({
+    id: r.id || String(i+1).padStart(2,'0'), title: r.title||'', description: r.description||'',
+    url: r.url||'', image: r.image||'', category: r.category||'', tag: r.tag||'', date: r.date||''
+  }));
+}
+
+async function autoLoadRootCsv(){
+  const rootId = Object.keys(lists).find(id => lists[id].isRoot);
+  if(!rootId || !projectDirHandle) return;
+  const rootList = lists[rootId];
+  if(rootList.rows.length > 0) return; // don't clobber rows already in memory (e.g. unsaved edits)
+  try{
+    const handle = await projectDirHandle.getFileHandle(rootList.csvFile || 'projects.csv', { create: false });
+    rootList.rows = rowsFromCsvText(await (await handle.getFile()).text());
+    csvHandles.set(rootId, handle);
+    if(currentListId === rootId) renderRowTable();
+    scheduleSave();
+  } catch(e){ /* no root CSV on disk yet — nothing to load */ }
+}
+
+async function autoLoadListCsv(listId){
+  const l = lists[listId];
+  if(!l || l.isRoot || !l.csvFile || !projectDirHandle) return;
+  if(l.rows.length > 0) return; // don't clobber rows already in memory
+  try{
+    const handle = await subcatDirHandle.getFileHandle(l.csvFile, { create: false });
+    l.rows = rowsFromCsvText(await (await handle.getFile()).text());
+    csvHandles.set(listId, handle);
+    scheduleSave();
+  } catch(e){ /* no CSV on disk yet for this subcategory — nothing to load */ }
+}
+
+/* ---------- Reconstruct a post's blocks from its actual saved HTML file ----------
+   This is the real fallback when postContentCache (session-only) has
+   nothing — it parses the file this same tool wrote, so a restart doesn't
+   lose real content, only the in-memory shortcut to it. */
+
+async function loadPostBlocksFromDisk(row){
+  if(!projectDirHandle || !row.url) return null;
+  const filename = row.url.split('/').pop();
+  try{
+    const handle = await postsDirHandle.getFileHandle(filename, { create: false });
+    postHtmlHandle = handle;
+    const text = await (await handle.getFile()).text();
+    return await parsePostHTMLToBlocks(text);
+  } catch(e){
+    return null; // file doesn't exist yet, or couldn't be read
+  }
+}
+
+async function parsePostHTMLToBlocks(html){
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const article = doc.querySelector('article');
+  if(!article) return [];
+  const children = [...article.children].filter(el => !el.classList.contains('tags'));
+  const blocks = [];
+  let i = 0;
+  while(i < children.length){
+    const el = children[i];
+
+    if(/^H[234]$/.test(el.tagName)){
+      blocks.push({ type: 'heading', level: el.tagName.toLowerCase(), align: el.style.textAlign || 'left', html: el.innerHTML });
+      i++; continue;
+    }
+
+    if(el.tagName === 'DIV' && el.style.fontFamily){
+      const fam = el.style.fontFamily;
+      const font = fam.includes('Source Serif') ? 'serif' : fam.includes('IBM Plex Mono') ? 'mono' : fam.includes('Oswald') ? 'display' : 'sans';
+      blocks.push({ type: 'text', font, size: parseInt(el.style.fontSize) || 16, align: el.style.textAlign || 'left', html: el.innerHTML });
+      i++; continue;
+    }
+
+    if(el.tagName === 'FIGURE' && el.classList.contains('inline-figure')){
+      const img = el.querySelector('img');
+      const figcaption = el.querySelector('figcaption');
+      const style = el.getAttribute('style') || '';
+      const widthMatch = /width:\s*([\d.]+)%/.exec(style);
+      const align = /margin-left:\s*auto;\s*margin-right:\s*auto/.test(style) ? 'center' : /margin-left:\s*auto/.test(style) ? 'right' : 'left';
+      let file = null;
+      const src = img ? img.getAttribute('src') : '';
+      if(src && src.startsWith('data:')){
+        try{ const res = await fetch(src); const blob = await res.blob(); file = new File([blob], 'image.' + (blob.type.split('/')[1] || 'jpg'), { type: blob.type }); } catch(e){}
+      }
+      blocks.push({ type: 'image', file, alt: img ? (img.getAttribute('alt') || '') : '', caption: figcaption ? figcaption.textContent : '', width: widthMatch ? widthMatch[1] : '100', align });
+      i++; continue;
+    }
+
+    if(el.tagName === 'P' && el.classList.contains('code-lang')){
+      const lang = el.textContent;
+      const pre = children[i+1] && children[i+1].tagName === 'PRE' ? children[i+1] : null;
+      const hasDesc = pre && children[i+2] && children[i+2].classList && children[i+2].classList.contains('code-desc');
+      const heightMatch = pre ? /height:\s*(\d+)px/.exec(pre.getAttribute('style') || '') : null;
+      blocks.push({ type: 'code', lang, code: pre && pre.querySelector('code') ? pre.querySelector('code').textContent : '', height: heightMatch ? heightMatch[1] : '220', description: hasDesc ? children[i+2].textContent : '' });
+      i += pre ? (hasDesc ? 3 : 2) : 1; continue;
+    }
+
+    if(el.tagName === 'PRE'){
+      const hasDesc = children[i+1] && children[i+1].classList && children[i+1].classList.contains('code-desc');
+      const heightMatch = /height:\s*(\d+)px/.exec(el.getAttribute('style') || '');
+      blocks.push({ type: 'code', lang: '', code: el.querySelector('code') ? el.querySelector('code').textContent : '', height: heightMatch ? heightMatch[1] : '220', description: hasDesc ? children[i+1].textContent : '' });
+      i += hasDesc ? 2 : 1; continue;
+    }
+
+    if(el.classList.contains('model-figure')){
+      const wireframeCb = el.querySelector('input[type=checkbox]');
+      const wireframe = wireframeCb ? wireframeCb.hasAttribute('checked') : false;
+      const scriptEl = children[i+1] && children[i+1].tagName === 'SCRIPT' ? children[i+1] : null;
+      const scriptText = scriptEl ? scriptEl.textContent : '';
+      const filenames = [...scriptText.matchAll(/['"]models\/([^'"]+)['"]/g)].map(m => m[1]);
+      let files = [];
+      if(filenames.length && modelsDirHandle){
+        for(const fn of filenames){
+          try{ const fh = await modelsDirHandle.getFileHandle(fn, { create: false }); files.push(await fh.getFile()); } catch(e){}
+        }
+      }
+      let idx = i + (scriptEl ? 2 : 1);
+      let caption = '';
+      if(children[idx] && children[idx].tagName === 'FIGCAPTION'){ caption = children[idx].textContent; idx++; }
+      blocks.push({ type: 'model', files, caption, wireframe });
+      i = idx; continue;
+    }
+
+    i++; // unrecognized element (e.g. a figcaption already consumed above) — skip
+  }
+  return blocks;
+}
 
 async function verifyPermission(handle){
   const opts = { mode: 'readwrite' };
@@ -2001,7 +2209,7 @@ async function restoreBlocksFromSnapshot(blocks){
 
 /* ---------- Edit an existing post ---------- */
 
-function editPost(row){
+async function editPost(row){
   const hasContent = blockListEl.children.length > 0 || pval('metaTitle').trim() !== '';
   if(hasContent && !confirm('Edit this post? The current post draft (not yet saved) will be cleared.')) return;
 
@@ -2024,7 +2232,9 @@ function editPost(row){
   currentPostRow = row;
   postHtmlHandle = postHandleCache.get(row) || null;
 
+  const banner = document.getElementById('attachBanner');
   const cached = postContentCache.get(row);
+
   if(cached){
     if(cached.heroFile){
       postFileStore.set('__hero__', cached.heroFile);
@@ -2037,15 +2247,28 @@ function editPost(row){
         dz.appendChild(label);
       });
     }
-    restoreBlocksFromSnapshot(cached.blocks).then(() => { renderPostPreview(); scheduleSave(); });
+    await restoreBlocksFromSnapshot(cached.blocks);
+    renderPostPreview();
   } else {
-    const banner = document.getElementById('attachBanner');
-    banner.textContent = 'This post\'s content wasn\'t loaded in this browser session, so blocks start empty here — its metadata above is already filled in. Add content and Save to overwrite the file.';
+    banner.textContent = 'Loading saved content from disk…';
     banner.classList.add('show');
+    const diskBlocks = await loadPostBlocksFromDisk(row);
+    if(diskBlocks && diskBlocks.length){
+      await restoreBlocksFromSnapshot(diskBlocks);
+      postContentCache.set(row, { heroFile: null, blocks: snapshotBlocks() }); // cache for the rest of this session
+      banner.classList.remove('show');
+      updatePostSaveStatus();
+    } else if(diskBlocks){
+      banner.textContent = 'This post\'s file exists but has no recognizable content blocks — starting empty. Add content and Save to overwrite it.';
+    } else {
+      banner.textContent = projectDirHandle
+        ? 'No saved file found for this post yet — starting empty.'
+        : 'Link your project folder to load this post\'s saved content — starting empty for now.';
+    }
+    renderPostPreview();
   }
 
   updatePostSaveStatus();
-  renderPostPreview();
   scheduleSave();
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
@@ -2355,6 +2578,7 @@ refreshAttachListOptions();
 renderPostPreview();
 updatePostSaveStatus();
 updateProjectFolderStatus();
+tryReconnectProjectFolder();
 
 if(draft && draft.postDraft){
   const m = draft.postDraft.meta || {};
