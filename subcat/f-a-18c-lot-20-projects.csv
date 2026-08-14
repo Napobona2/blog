@@ -1,6 +1,6 @@
-id,title,description,url,image,category,tag,date
-01,Flight Stick,3d printed flight stick of the aircraft,posts/stick.html,images/25.jpeg,,,2026-08-13
-02,Throttle,3d printed Throttle of the aircraft,posts/throttle.html,images/throttle.jpg,,,2026-08-13
-03,Cockpit,The entire cockpit made out of wood,posts/cockpit.html,images/cockpit.jpg,,,2026-08-13
-04,CAD,The whole cockpit in Catia,posts/cad.html,images/cad.jpg,,,2026-08-13
-05,Base Model (Open Hornet),,posts/base-model-open-hornet.html,images/base-model-open-hornet.jpg,,,2026-08-13
+id,title,description,url,image,focus,zoom,category,tag,date
+01,Flight Stick,3d printed flight stick of the aircraft,posts/stick.html,images/26.jpeg,"70,62",110,,,2026-08-13
+02,Throttle,3d printed Throttle of the aircraft,posts/throttle.html,images/throttle.jpg,,,,,2026-08-13
+03,Cockpit,The entire cockpit made out of wood,posts/cockpit.html,images/cockpit.jpg,,,,,2026-08-13
+04,CAD,The whole cockpit in Catia,posts/cad.html,images/cad.jpg,,,,,2026-08-13
+05,Base Model (Open Hornet),,posts/base-model-open-hornet.html,images/base-model-open-hornet.jpg,,,,,2026-08-13

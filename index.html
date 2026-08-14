@@ -85,6 +85,10 @@ async function init(){
       if(p.image){
         const img = document.createElement('img');
         img.src = p.image; img.alt = ''; img.loading = 'lazy';
+        const focus = (p.focus || '50,50').split(',');
+        img.style.objectPosition = (focus[0]||'50').trim() + '% ' + (focus[1]||'50').trim() + '%';
+        const zoom = parseFloat(p.zoom) || 100;
+        img.style.transform = 'scale(' + (zoom/100) + ')';
         img.addEventListener('error', () => { img.remove(); thumb.insertAdjacentHTML('beforeend', placeholder); }, { once:true });
         thumb.appendChild(img);
       } else {

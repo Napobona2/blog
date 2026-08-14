@@ -221,7 +221,11 @@
   .row-card .thumb{
     aspect-ratio: 16/10; border-bottom: 1.5px solid var(--ink); background: var(--paper);
     position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: outline-color .12s ease;
+    outline: 2px dashed transparent; outline-offset: -2px;
   }
+  .row-card .thumb:hover{ outline-color: var(--paper-line); }
+  .row-card .thumb.drag{ outline-color: var(--stamp); }
   .row-card .thumb img{ width: 100%; height: 100%; object-fit: cover; }
   .row-card .thumb .placeholder{
     font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--graphite);
@@ -236,6 +240,7 @@
   .row-card .drag-handle{
     position: absolute; top: 5px; right: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 12px;
     color: var(--ink); background: var(--paper); border: 1px solid var(--ink); padding: 1px 7px;
+    cursor: grab; z-index: 2;
   }
   .row-card .card-body2{ padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 5px; flex: 1; }
   .row-card .title-input{
@@ -488,7 +493,7 @@ function parseCSV(text){
   return rows.map(r => Object.fromEntries(header.map((h, idx) => [h, (r[idx] || '').trim()])));
 }
 
-const CSV_COLUMNS = ['id','title','description','url','image','category','tag','date'];
+const CSV_COLUMNS = ['id','title','description','url','image','focus','zoom','category','tag','date'];
 
 function csvEscape(v){
   v = String(v ?? '');
@@ -700,13 +705,78 @@ function renderRowTable(){
     handle.addEventListener('mouseup', () => { card.draggable = false; });
     thumb.append(dwg, handle);
 
+    let justRepositioned = false; // suppresses the thumb's click-to-browse right after a reposition drag
+
+    function parseFocus(){
+      const [fx, fy] = (row.focus || '50,50').split(',').map(Number);
+      return { x: Number.isFinite(fx) ? fx : 50, y: Number.isFinite(fy) ? fy : 50 };
+    }
+    function parseZoom(){
+      const z = parseFloat(row.zoom);
+      return Number.isFinite(z) && z >= 100 ? z : 100;
+    }
+
+    function makeRepositionable(img){
+      img.draggable = false; // disable the browser's native "drag image out" gesture — it was hijacking horizontal movement specifically, since that's its preferred drag axis
+      img.style.cssText += 'user-select:none;-webkit-user-drag:none;';
+      img.style.cursor = 'move';
+      const f = parseFocus();
+      img.style.objectPosition = f.x + '% ' + f.y + '%';
+      img.style.transform = 'scale(' + (parseZoom() / 100) + ')';
+
+      let dragging = false, startX, startY, startFocus, pending;
+
+      img.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        dragging = true;
+        img.setPointerCapture(e.pointerId);
+        startX = e.clientX; startY = e.clientY;
+        startFocus = parseFocus();
+        pending = null;
+      });
+      img.addEventListener('pointermove', (e) => {
+        if(!dragging) return;
+        const rect = thumb.getBoundingClientRect();
+        const dxPct = ((e.clientX - startX) / rect.width) * 100;
+        const dyPct = ((e.clientY - startY) / rect.height) * 100;
+        const x = Math.max(0, Math.min(100, startFocus.x - dxPct));
+        const y = Math.max(0, Math.min(100, startFocus.y - dyPct));
+        img.style.objectPosition = x + '% ' + y + '%';
+        pending = { x, y };
+      });
+      function finish(e){
+        if(!dragging) return;
+        dragging = false;
+        try{ img.releasePointerCapture(e.pointerId); } catch(err){}
+        if(pending){
+          row.focus = Math.round(pending.x) + ',' + Math.round(pending.y);
+          justRepositioned = true;
+          setTimeout(() => { justRepositioned = false; }, 0);
+          scheduleSave();
+        }
+      }
+      img.addEventListener('pointerup', finish);
+      img.addEventListener('pointercancel', finish);
+
+      img.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const next = Math.max(100, Math.min(400, parseZoom() + (e.deltaY < 0 ? 10 : -10)));
+        row.zoom = String(Math.round(next));
+        img.style.transform = 'scale(' + (next / 100) + ')';
+        if(zoomSliderEl) zoomSliderEl.value = row.zoom;
+        if(zoomOutEl) zoomOutEl.textContent = Math.round(next) + '%';
+        scheduleSave();
+      }, { passive: false });
+    }
+
     function refreshThumb(){
       thumb.querySelectorAll('img, .placeholder').forEach(el => el.remove());
-      if(isPreviewableImage(row.image)){
+      if(row._previewBlobUrl || isPreviewableImage(row.image)){
         const img = document.createElement('img');
-        img.src = row.image; img.alt = '';
+        img.src = row._previewBlobUrl || row.image; img.alt = '';
         img.addEventListener('error', () => { img.remove(); addPlaceholder(); }, { once: true });
         thumb.appendChild(img);
+        makeRepositionable(img);
       } else {
         addPlaceholder();
       }
@@ -714,16 +784,60 @@ function renderRowTable(){
     function addPlaceholder(){
       const ph = document.createElement('div');
       ph.className = 'placeholder';
-      ph.textContent = row.image ? 'Preview not shown\n(local path)' : 'No preview yet';
+      ph.textContent = row.image ? 'Preview not shown\n(local path)' : 'Drop a cover image';
       thumb.appendChild(ph);
     }
     refreshThumb();
+
+    async function applyCoverImage(file){
+      if(row._previewBlobUrl) URL.revokeObjectURL(row._previewBlobUrl);
+      row._previewBlobUrl = URL.createObjectURL(file);
+      row.image = 'images/' + file.name;
+      row.focus = '50,50'; // reset positioning — the old focus point was for a different image
+      row.zoom = '100';
+      row._imageAuto = false;
+      if(imageInputEl) imageInputEl.value = row.image;
+      if(zoomSliderEl){ zoomSliderEl.value = '100'; zoomOutEl.textContent = '100%'; }
+      refreshThumb();
+      if(projectDirHandle){
+        try{
+          const dir = l.isRoot ? rootImagesDirHandle : subcatImagesDirHandle;
+          const fh = await dir.getFileHandle(file.name, { create: true });
+          await writeToHandle(fh, file);
+          note('saved images/' + file.name + ' · ' + new Date().toLocaleTimeString());
+        } catch(err){
+          alert('Could not save the image file: ' + err.message);
+        }
+      } else {
+        note('cover image set (link your project folder to save the file automatically)');
+      }
+      scheduleSave();
+    }
+
+    const thumbFileInput = document.createElement('input');
+    thumbFileInput.type = 'file'; thumbFileInput.accept = 'image/*'; thumbFileInput.hidden = true;
+    thumbFileInput.addEventListener('change', () => { if(thumbFileInput.files[0]) applyCoverImage(thumbFileInput.files[0]); });
+    thumb.appendChild(thumbFileInput);
+
+    thumb.addEventListener('click', (e) => {
+      if(e.target.closest('.drag-handle')) return;
+      if(justRepositioned) return;
+      thumbFileInput.click();
+    });
+    ['dragenter','dragover'].forEach(evt => thumb.addEventListener(evt, e => { e.preventDefault(); thumb.classList.add('drag'); }));
+    ['dragleave','drop'].forEach(evt => thumb.addEventListener(evt, e => { e.preventDefault(); thumb.classList.remove('drag'); }));
+    thumb.addEventListener('drop', e => {
+      const file = [...(e.dataTransfer.files || [])].find(f => f.type.startsWith('image/'));
+      if(file) applyCoverImage(file);
+    });
 
     const body = document.createElement('div');
     body.className = 'card-body2';
 
     let urlInputEl = null;    // assigned below once the URL meta field is built; referenced by the title listener
     let imageInputEl = null;  // assigned below once the Image meta field is built; referenced by the title listener
+    let zoomSliderEl = null;  // assigned below once the Zoom slider is built; referenced by the wheel-zoom handler
+    let zoomOutEl = null;
 
     if(row._urlAuto === undefined) row._urlAuto = !row.url;
     if(row._imageAuto === undefined) row._imageAuto = !row.image;
@@ -755,7 +869,7 @@ function renderRowTable(){
 
     const toggle = document.createElement('button');
     toggle.type = 'button'; toggle.className = 'meta-toggle';
-    toggle.textContent = '⚙ url / image / tag / date';
+    toggle.textContent = '⚙ url / image / zoom / tag / date';
 
     const metaFields = document.createElement('div');
     metaFields.className = 'meta-fields';
@@ -768,7 +882,14 @@ function renderRowTable(){
       inp.addEventListener('input', () => {
         row[col] = inp.value;
         if(col === 'url') row._urlAuto = false;      // manual edit takes over from here
-        if(col === 'image'){ row._imageAuto = false; refreshThumb(); }
+        if(col === 'image'){
+          row._imageAuto = false;
+          row.focus = '50,50'; // reset positioning — path changed, old focus point may no longer apply
+          row.zoom = '100';
+          if(zoomSliderEl){ zoomSliderEl.value = '100'; zoomOutEl.textContent = '100%'; }
+          if(row._previewBlobUrl){ URL.revokeObjectURL(row._previewBlobUrl); row._previewBlobUrl = null; }
+          refreshThumb();
+        }
         scheduleSave();
       });
       w.append(lab, inp);
@@ -787,7 +908,28 @@ function renderRowTable(){
     const row3 = document.createElement('div'); row3.className = 'mrow';
     row3.append(metaInput('Date', 'date'));
 
-    metaFields.append(row1, row2, row3);
+    const zoomRow = document.createElement('div'); zoomRow.className = 'mrow';
+    const zoomWrap = document.createElement('div');
+    const zoomLab = document.createElement('label'); zoomLab.textContent = 'Zoom';
+    const zoomInner = document.createElement('div'); zoomInner.style.cssText = 'display:flex;align-items:center;gap:6px;';
+    zoomSliderEl = document.createElement('input');
+    zoomSliderEl.type = 'range'; zoomSliderEl.min = '100'; zoomSliderEl.max = '400'; zoomSliderEl.step = '5';
+    zoomSliderEl.value = row.zoom || '100';
+    zoomSliderEl.style.width = '100%';
+    zoomOutEl = document.createElement('span'); zoomOutEl.className = 'range-readout';
+    zoomOutEl.textContent = (row.zoom || '100') + '%';
+    zoomSliderEl.addEventListener('input', () => {
+      row.zoom = zoomSliderEl.value;
+      zoomOutEl.textContent = row.zoom + '%';
+      const img = thumb.querySelector('img');
+      if(img) img.style.transform = 'scale(' + (parseFloat(row.zoom) / 100) + ')';
+      scheduleSave();
+    });
+    zoomInner.append(zoomSliderEl, zoomOutEl);
+    zoomWrap.append(zoomLab, zoomInner);
+    zoomRow.append(zoomWrap);
+
+    metaFields.append(row1, row2, row3, zoomRow);
 
     toggle.addEventListener('click', () => metaFields.classList.toggle('open'));
 
@@ -892,7 +1034,7 @@ function renumberRows(l){
 
 function addBlankRow(){
   const l = lists[currentListId];
-  l.rows.push({ id: String(l.rows.length+1).padStart(2,'0'), title:'', description:'', url:'', image:'', category:'', tag:'', date: new Date().toISOString().slice(0,10) });
+  l.rows.push({ id: String(l.rows.length+1).padStart(2,'0'), title:'', description:'', url:'', image:'', focus:'50,50', zoom:'100', category:'', tag:'', date: new Date().toISOString().slice(0,10) });
   renderRowTable();
   scheduleSave();
 }
@@ -984,6 +1126,8 @@ let subcatDirHandle = null;
 let postsDirHandle = null;
 let modelsDirHandle = null;
 let videosDirHandle = null;
+let rootImagesDirHandle = null;
+let subcatImagesDirHandle = null;
 let pendingFolderHandle = null; // a remembered handle from IndexedDB that still needs permission re-granted
 
 /* ---------- IndexedDB: persists the folder handle itself across restarts ---------- */
@@ -1036,7 +1180,7 @@ function updateProjectFolderStatus(){
   }
   if(btn) btn.hidden = false;
   if(projectDirHandle){
-    el.textContent = 'Linked: ' + projectDirHandle.name + '  (root · subcat/ · subcat/posts/ · models/ · videos/)';
+    el.textContent = 'Linked: ' + projectDirHandle.name + '  (root · images/ · subcat/ · subcat/images/ · subcat/posts/ · models/ · videos/)';
     if(btn) btn.textContent = 'Change project folder…';
   } else if(pendingFolderHandle){
     el.textContent = 'Remembered folder "' + pendingFolderHandle.name + '" — needs permission re-granted after the restart.';
@@ -1053,6 +1197,8 @@ async function connectProjectFolder(handle){
   postsDirHandle = await subcatDirHandle.getDirectoryHandle('posts', { create: true });
   modelsDirHandle = await postsDirHandle.getDirectoryHandle('models', { create: true });
   videosDirHandle = await postsDirHandle.getDirectoryHandle('videos', { create: true });
+  rootImagesDirHandle = await projectDirHandle.getDirectoryHandle('images', { create: true });
+  subcatImagesDirHandle = await subcatDirHandle.getDirectoryHandle('images', { create: true });
   pendingFolderHandle = null;
   updateProjectFolderStatus();
   updateListSaveStatus();
@@ -1104,7 +1250,7 @@ document.getElementById('linkFolderBtn').addEventListener('click', linkProjectFo
 function rowsFromCsvText(text){
   return parseCSV(text).map((r, i) => ({
     id: r.id || String(i+1).padStart(2,'0'), title: r.title||'', description: r.description||'',
-    url: r.url||'', image: r.image||'', category: r.category||'', tag: r.tag||'', date: r.date||''
+    url: r.url||'', image: r.image||'', focus: r.focus || '50,50', zoom: r.zoom || '100', category: r.category||'', tag: r.tag||'', date: r.date||''
   }));
 }
 
@@ -1297,7 +1443,7 @@ function updatePostSaveStatus(){
 function applyLoadedCsvRows(text, filename){
   const rows = parseCSV(text).map((r, i) => ({
     id: r.id || String(i+1).padStart(2,'0'), title: r.title||'', description: r.description||'',
-    url: r.url||'', image: r.image||'', category: r.category||'', tag: r.tag||'', date: r.date||''
+    url: r.url||'', image: r.image||'', focus: r.focus || '50,50', zoom: r.zoom || '100', category: r.category||'', tag: r.tag||'', date: r.date||''
   }));
   lists[currentListId].rows = rows;
   if(filename){
@@ -1687,6 +1833,10 @@ async function init(){
       if(p.image){
         const img = document.createElement('img');
         img.src = p.image; img.alt = ''; img.loading = 'lazy';
+        const focus = (p.focus || '50,50').split(',');
+        img.style.objectPosition = (focus[0]||'50').trim() + '% ' + (focus[1]||'50').trim() + '%';
+        const zoom = parseFloat(p.zoom) || 100;
+        img.style.transform = 'scale(' + (zoom/100) + ')';
         img.addEventListener('error', () => { img.remove(); thumb.insertAdjacentHTML('beforeend', placeholder); }, { once:true });
         thumb.appendChild(img);
       } else {
