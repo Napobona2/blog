@@ -85,10 +85,17 @@ async function init(){
       if(p.image){
         const img = document.createElement('img');
         img.src = p.image; img.alt = ''; img.loading = 'lazy';
-        const focus = (p.focus || '50,50').split(',');
-        img.style.objectPosition = (focus[0]||'50').trim() + '% ' + (focus[1]||'50').trim() + '%';
-        const zoom = parseFloat(p.zoom) || 100;
-        img.style.transform = 'scale(' + (zoom/100) + ')';
+        const focus = (p.focus || '50,50').split(',').map(Number);
+        const fx = Number.isFinite(focus[0]) ? focus[0] : 50;
+        const fy = Number.isFinite(focus[1]) ? focus[1] : 50;
+        const zoom = Math.max(100, parseFloat(p.zoom) || 100);
+        const maxOffset = Math.max(0, zoom - 100);
+        img.style.position = 'absolute';
+        img.style.width = zoom + '%';
+        img.style.height = zoom + '%';
+        img.style.objectFit = 'cover';
+        img.style.left = (maxOffset ? -(maxOffset * (fx/100)) : 0) + '%';
+        img.style.top = (maxOffset ? -(maxOffset * (fy/100)) : 0) + '%';
         img.addEventListener('error', () => { img.remove(); thumb.insertAdjacentHTML('beforeend', placeholder); }, { once:true });
         thumb.appendChild(img);
       } else {

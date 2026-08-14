@@ -716,22 +716,46 @@ function renderRowTable(){
       return Number.isFinite(z) && z >= 100 ? z : 100;
     }
 
+    /* The image itself is sized to zoom% of the frame (not visually scaled
+       after the fact) so that zooming in genuinely creates room to pan in
+       both directions — a cosmetic transform:scale() applied after
+       object-fit had already fixed the crop doesn't do that, which was the
+       bug: panning range only ever existed on whichever axis the image's
+       own aspect ratio already needed cropping on. */
+    function leftTopFor(zoom, focus){
+      const maxOffset = Math.max(0, zoom - 100);
+      return {
+        left: maxOffset ? -(maxOffset * (focus.x / 100)) : 0,
+        top: maxOffset ? -(maxOffset * (focus.y / 100)) : 0,
+        maxOffset
+      };
+    }
+
+    function applyImgTransform(img){
+      const zoom = parseZoom();
+      const pos = leftTopFor(zoom, parseFocus());
+      img.style.position = 'absolute';
+      img.style.width = zoom + '%';
+      img.style.height = zoom + '%';
+      img.style.objectFit = 'cover';
+      img.style.left = pos.left + '%';
+      img.style.top = pos.top + '%';
+    }
+
     function makeRepositionable(img){
-      img.draggable = false; // disable the browser's native "drag image out" gesture — it was hijacking horizontal movement specifically, since that's its preferred drag axis
+      img.draggable = false; // disable the browser's native "drag image out" gesture
       img.style.cssText += 'user-select:none;-webkit-user-drag:none;';
       img.style.cursor = 'move';
-      const f = parseFocus();
-      img.style.objectPosition = f.x + '% ' + f.y + '%';
-      img.style.transform = 'scale(' + (parseZoom() / 100) + ')';
+      applyImgTransform(img);
 
-      let dragging = false, startX, startY, startFocus, pending;
+      let dragging = false, startX, startY, startPos, pending;
 
       img.addEventListener('pointerdown', (e) => {
         e.preventDefault();
         dragging = true;
         img.setPointerCapture(e.pointerId);
         startX = e.clientX; startY = e.clientY;
-        startFocus = parseFocus();
+        startPos = leftTopFor(parseZoom(), parseFocus());
         pending = null;
       });
       img.addEventListener('pointermove', (e) => {
@@ -739,17 +763,21 @@ function renderRowTable(){
         const rect = thumb.getBoundingClientRect();
         const dxPct = ((e.clientX - startX) / rect.width) * 100;
         const dyPct = ((e.clientY - startY) / rect.height) * 100;
-        const x = Math.max(0, Math.min(100, startFocus.x - dxPct));
-        const y = Math.max(0, Math.min(100, startFocus.y - dyPct));
-        img.style.objectPosition = x + '% ' + y + '%';
-        pending = { x, y };
+        const maxOffset = startPos.maxOffset;
+        const left = maxOffset ? Math.max(-maxOffset, Math.min(0, startPos.left + dxPct)) : 0;
+        const top = maxOffset ? Math.max(-maxOffset, Math.min(0, startPos.top + dyPct)) : 0;
+        img.style.left = left + '%';
+        img.style.top = top + '%';
+        pending = { left, top, maxOffset };
       });
       function finish(e){
         if(!dragging) return;
         dragging = false;
         try{ img.releasePointerCapture(e.pointerId); } catch(err){}
         if(pending){
-          row.focus = Math.round(pending.x) + ',' + Math.round(pending.y);
+          const fx = pending.maxOffset ? Math.round(-pending.left / pending.maxOffset * 100) : 50;
+          const fy = pending.maxOffset ? Math.round(-pending.top / pending.maxOffset * 100) : 50;
+          row.focus = fx + ',' + fy;
           justRepositioned = true;
           setTimeout(() => { justRepositioned = false; }, 0);
           scheduleSave();
@@ -762,11 +790,25 @@ function renderRowTable(){
         e.preventDefault();
         const next = Math.max(100, Math.min(400, parseZoom() + (e.deltaY < 0 ? 10 : -10)));
         row.zoom = String(Math.round(next));
-        img.style.transform = 'scale(' + (next / 100) + ')';
+        applyImgTransform(img);
         if(zoomSliderEl) zoomSliderEl.value = row.zoom;
         if(zoomOutEl) zoomOutEl.textContent = Math.round(next) + '%';
         scheduleSave();
       }, { passive: false });
+    }
+
+    async function tryLoadImageFromDisk(){
+      if(row._previewBlobUrl || !row.image || isPreviewableImage(row.image) || !projectDirHandle) return false;
+      const dir = l.isRoot ? rootImagesDirHandle : subcatImagesDirHandle;
+      if(!dir) return false;
+      const filename = row.image.split('/').pop();
+      try{
+        const fh = await dir.getFileHandle(filename, { create: false });
+        row._previewBlobUrl = URL.createObjectURL(await fh.getFile());
+        return true;
+      } catch(e){
+        return false; // file doesn't exist there (yet), or couldn't be read
+      }
     }
 
     function refreshThumb(){
@@ -779,6 +821,9 @@ function renderRowTable(){
         makeRepositionable(img);
       } else {
         addPlaceholder();
+        if(row.image && projectDirHandle){
+          tryLoadImageFromDisk().then(loaded => { if(loaded) refreshThumb(); });
+        }
       }
     }
     function addPlaceholder(){
@@ -922,7 +967,7 @@ function renderRowTable(){
       row.zoom = zoomSliderEl.value;
       zoomOutEl.textContent = row.zoom + '%';
       const img = thumb.querySelector('img');
-      if(img) img.style.transform = 'scale(' + (parseFloat(row.zoom) / 100) + ')';
+      if(img) applyImgTransform(img);
       scheduleSave();
     });
     zoomInner.append(zoomSliderEl, zoomOutEl);
@@ -1204,6 +1249,7 @@ async function connectProjectFolder(handle){
   updateListSaveStatus();
   updatePostSaveStatus();
   await autoLoadRootCsv();
+  renderRowTable(); // re-render whatever's currently visible so any cover images already shown as placeholders get a chance to load from disk now that the folder is connected
 }
 
 async function linkProjectFolder(){
@@ -1833,10 +1879,17 @@ async function init(){
       if(p.image){
         const img = document.createElement('img');
         img.src = p.image; img.alt = ''; img.loading = 'lazy';
-        const focus = (p.focus || '50,50').split(',');
-        img.style.objectPosition = (focus[0]||'50').trim() + '% ' + (focus[1]||'50').trim() + '%';
-        const zoom = parseFloat(p.zoom) || 100;
-        img.style.transform = 'scale(' + (zoom/100) + ')';
+        const focus = (p.focus || '50,50').split(',').map(Number);
+        const fx = Number.isFinite(focus[0]) ? focus[0] : 50;
+        const fy = Number.isFinite(focus[1]) ? focus[1] : 50;
+        const zoom = Math.max(100, parseFloat(p.zoom) || 100);
+        const maxOffset = Math.max(0, zoom - 100);
+        img.style.position = 'absolute';
+        img.style.width = zoom + '%';
+        img.style.height = zoom + '%';
+        img.style.objectFit = 'cover';
+        img.style.left = (maxOffset ? -(maxOffset * (fx/100)) : 0) + '%';
+        img.style.top = (maxOffset ? -(maxOffset * (fy/100)) : 0) + '%';
         img.addEventListener('error', () => { img.remove(); thumb.insertAdjacentHTML('beforeend', placeholder); }, { once:true });
         thumb.appendChild(img);
       } else {
