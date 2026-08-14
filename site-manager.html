@@ -435,6 +435,7 @@
           <button data-add="image">+ Image</button>
           <button data-add="code">+ Code block</button>
           <button data-add="model">+ 3D model</button>
+          <button data-add="video">+ Video</button>
         </div>
         <p class="hint" style="text-align:center;margin-top:-30px;margin-bottom:40px;">Drag a block by its ⠿ handle to reorder.</p>
 
@@ -981,6 +982,7 @@ let projectDirHandle = null;
 let subcatDirHandle = null;
 let postsDirHandle = null;
 let modelsDirHandle = null;
+let videosDirHandle = null;
 let pendingFolderHandle = null; // a remembered handle from IndexedDB that still needs permission re-granted
 
 /* ---------- IndexedDB: persists the folder handle itself across restarts ---------- */
@@ -1033,7 +1035,7 @@ function updateProjectFolderStatus(){
   }
   if(btn) btn.hidden = false;
   if(projectDirHandle){
-    el.textContent = 'Linked: ' + projectDirHandle.name + '  (root · subcat/ · subcat/posts/ · subcat/posts/models/)';
+    el.textContent = 'Linked: ' + projectDirHandle.name + '  (root · subcat/ · subcat/posts/ · models/ · videos/)';
     if(btn) btn.textContent = 'Change project folder…';
   } else if(pendingFolderHandle){
     el.textContent = 'Remembered folder "' + pendingFolderHandle.name + '" — needs permission re-granted after the restart.';
@@ -1049,6 +1051,7 @@ async function connectProjectFolder(handle){
   subcatDirHandle = await projectDirHandle.getDirectoryHandle('subcat', { create: true });
   postsDirHandle = await subcatDirHandle.getDirectoryHandle('posts', { create: true });
   modelsDirHandle = await postsDirHandle.getDirectoryHandle('models', { create: true });
+  videosDirHandle = await postsDirHandle.getDirectoryHandle('videos', { create: true });
   pendingFolderHandle = null;
   updateProjectFolderStatus();
   updateListSaveStatus();
@@ -1218,6 +1221,28 @@ async function parsePostHTMLToBlocks(html){
       if(children[idx] && children[idx].tagName === 'FIGCAPTION'){ caption = children[idx].textContent; idx++; }
       blocks.push({ type: 'model', files, caption, wireframe });
       i = idx; continue;
+    }
+
+    if(el.tagName === 'FIGURE' && el.classList.contains('video-figure')){
+      const video = el.querySelector('video');
+      const source = video ? video.querySelector('source') : null;
+      const figcaption = el.querySelector('figcaption');
+      const style = el.getAttribute('style') || '';
+      const widthMatch = /width:\s*([\d.]+)%/.exec(style);
+      const align = /margin-left:\s*auto;\s*margin-right:\s*auto/.test(style) ? 'center' : /margin-left:\s*auto/.test(style) ? 'right' : 'left';
+      const src = source ? source.getAttribute('src') : '';
+      const filename = src ? src.split('/').pop() : null;
+      let file = null;
+      if(filename && videosDirHandle){
+        try{ const fh = await videosDirHandle.getFileHandle(filename, { create: false }); file = await fh.getFile(); } catch(e){}
+      }
+      blocks.push({
+        type: 'video', file, caption: figcaption ? figcaption.textContent : '',
+        loop: video ? video.hasAttribute('loop') : false,
+        autoplay: video ? video.hasAttribute('autoplay') : false,
+        width: widthMatch ? widthMatch[1] : '100', align
+      });
+      i++; continue;
     }
 
     i++; // unrecognized element (e.g. a figcaption already consumed above) — skip
@@ -1717,6 +1742,12 @@ function collectPostTextDraft(){
     } else if(type === 'model'){
       base.caption = card.querySelector('.f-caption').value;
       base.wireframe = card.querySelector('.f-wireframe').checked;
+    } else if(type === 'video'){
+      base.caption = card.querySelector('.f-caption').value;
+      base.loop = card.querySelector('.f-loop').checked;
+      base.autoplay = card.querySelector('.f-autoplay').checked;
+      base.width = card.querySelector('.f-width').value;
+      base.align = card.querySelector('.f-align').value;
     }
     return base;
   });
@@ -2063,9 +2094,69 @@ async function addModelBlock(preset){
   scheduleSave();
 }
 
+/* ---------- Video block ---------- */
+
+function addVideoBlock(preset){
+  const { card, body } = cardShell('video', 'Video');
+  const dz = document.createElement('div'); dz.className = 'dropzone'; dz.tabIndex = 0;
+  dz.textContent = 'Drag & drop a video file, or click to choose one';
+  const fileInput = document.createElement('input'); fileInput.type = 'file'; fileInput.accept = 'video/*'; fileInput.hidden = true;
+
+  const preview = document.createElement('video');
+  preview.controls = true; preview.style.cssText = 'width:100%;max-height:320px;display:none;background:#000;';
+
+  function applyVideoFile(file){
+    const store = postFileStore.get(card.id) || {};
+    store.video = file; postFileStore.set(card.id, store);
+    if(preview.src) URL.revokeObjectURL(preview.src);
+    preview.src = URL.createObjectURL(file);
+    preview.style.display = 'block';
+    dz.textContent = file.name + ' — drop a different file to replace';
+  }
+
+  setupDropzone(dz, fileInput, (file) => { applyVideoFile(file); scheduleSave(); });
+
+  const caption = document.createElement('input'); caption.type = 'text'; caption.className = 'f-caption'; caption.placeholder = 'Caption shown under the video';
+  caption.addEventListener('input', scheduleSave);
+
+  const optRow = document.createElement('div'); optRow.className = 'check-row';
+  const loop = document.createElement('input'); loop.type = 'checkbox'; loop.className = 'f-loop';
+  const loopLabel = document.createElement('label'); loopLabel.textContent = 'Loop';
+  const autoplay = document.createElement('input'); autoplay.type = 'checkbox'; autoplay.className = 'f-autoplay';
+  const autoplayLabel = document.createElement('label'); autoplayLabel.textContent = 'Autoplay (muted)';
+  optRow.append(loop, loopLabel, autoplay, autoplayLabel);
+  [loop, autoplay].forEach(el => el.addEventListener('change', scheduleSave));
+
+  const row = document.createElement('div'); row.className = 'row';
+  const width = document.createElement('input');
+  width.type = 'range'; width.min = 25; width.max = 100; width.value = 100; width.step = 5; width.className = 'f-width';
+  const widthOut = document.createElement('span'); widthOut.className = 'range-readout'; widthOut.textContent = '100%';
+  width.addEventListener('input', () => { widthOut.textContent = width.value+'%'; scheduleSave(); });
+  const widthWrap = document.createElement('div'); widthWrap.append(width, widthOut);
+  const align = document.createElement('select'); align.className = 'f-align';
+  ['center','left','right'].forEach(a => { const o=document.createElement('option'); o.value=a; o.textContent=a; align.appendChild(o); });
+  align.addEventListener('change', scheduleSave);
+  row.append(field('Display width', widthWrap), field('Alignment', align));
+
+  body.append(field('Video', dz), fileInput, preview, optRow, row, field('Caption', caption));
+  body.append(mkHint('Drag & drop to import. On save, the file is written to subcat/posts/videos/ (needs the project folder linked) rather than embedded, since video files are usually too large for that.'));
+
+  if(preset){
+    caption.value = preset.caption || '';
+    loop.checked = !!preset.loop;
+    autoplay.checked = !!preset.autoplay;
+    width.value = preset.width || 100;
+    widthOut.textContent = width.value + '%';
+    align.value = preset.align || 'center';
+    if(preset.file) applyVideoFile(preset.file);
+  }
+  blockListEl.appendChild(card);
+  scheduleSave();
+}
+
 document.querySelectorAll('.add-toolbar [data-add]').forEach(b => {
   b.addEventListener('click', () => {
-    const fn = { heading: addHeadingBlock, text: addTextBlock, image: addImageBlock, code: addCodeBlock, model: addModelBlock }[b.dataset.add];
+    const fn = { heading: addHeadingBlock, text: addTextBlock, image: addImageBlock, code: addCodeBlock, model: addModelBlock, video: addVideoBlock }[b.dataset.add];
     fn();
   });
 });
@@ -2133,6 +2224,18 @@ function renderPostPreview(){
       const loaded = store && store.models && store.models.length;
       return `<div class="pp-model-stub">◈ 3D model ${loaded ? '— rendered live in the block above' : '(none dropped yet)'}${caption ? '<br>' + caption : ''}</div>`;
     }
+    if(type === 'video'){
+      const store = postFileStore.get(card.id);
+      const width = card.querySelector('.f-width').value;
+      const align = card.querySelector('.f-align').value;
+      const caption = escapeHtml(card.querySelector('.f-caption').value);
+      const loop = card.querySelector('.f-loop').checked;
+      const margin = align === 'center' ? 'margin-left:auto;margin-right:auto;' : (align === 'right' ? 'margin-left:auto;' : '');
+      if(store && store.video){
+        return `<figure class="pp-figure" style="width:${width}%;${margin}"><video src="${objectUrlFor(store.video)}" controls${loop ? ' loop' : ''} style="width:100%;display:block;border:1.5px solid var(--ink);background:#000;"></video>${caption ? `<figcaption>${caption}</figcaption>` : ''}</figure>`;
+      }
+      return `<div class="pp-empty-block">Video not added yet</div>`;
+    }
     return '';
   }).join('\n');
 
@@ -2193,6 +2296,10 @@ function snapshotBlocks(){
       const store = postFileStore.get(card.id);
       return { type, files: store && store.models, caption: card.querySelector('.f-caption').value, wireframe: card.querySelector('.f-wireframe').checked };
     }
+    if(type === 'video'){
+      const store = postFileStore.get(card.id);
+      return { type, file: store && store.video, caption: card.querySelector('.f-caption').value, loop: card.querySelector('.f-loop').checked, autoplay: card.querySelector('.f-autoplay').checked, width: card.querySelector('.f-width').value, align: card.querySelector('.f-align').value };
+    }
     return null;
   }).filter(Boolean);
 }
@@ -2204,6 +2311,7 @@ async function restoreBlocksFromSnapshot(blocks){
     else if(b.type === 'image') addImageBlock(b);
     else if(b.type === 'code') addCodeBlock(b);
     else if(b.type === 'model') await addModelBlock(b);
+    else if(b.type === 'video') addVideoBlock(b);
   }
 }
 
@@ -2381,6 +2489,20 @@ async function buildPostHTML(){
         parts.push(buildViewerBlockHTML(id, filenames, wireframe));
         if(caption) parts.push(`<figcaption>${caption}</figcaption>`);
       }
+    } else if(type === 'video'){
+      const store = postFileStore.get(card.id);
+      if(store && store.video){
+        const filename = store.video.name;
+        const mime = store.video.type || 'video/mp4';
+        const caption = escapeHtml(card.querySelector('.f-caption').value);
+        const width = card.querySelector('.f-width').value;
+        const align = card.querySelector('.f-align').value;
+        const loop = card.querySelector('.f-loop').checked;
+        const autoplay = card.querySelector('.f-autoplay').checked;
+        const marginRule = align === 'center' ? 'margin-left:auto;margin-right:auto;' : (align === 'right' ? 'margin-left:auto;' : '');
+        const attrs = 'controls' + (loop ? ' loop' : '') + (autoplay ? ' autoplay muted playsinline' : '');
+        parts.push(`\n<figure class="video-figure" style="width:${width}%;${marginRule}">\n  <video ${attrs}><source src="videos/${escapeHtml(filename)}" type="${escapeHtml(mime)}"></video>\n  ${caption ? `<figcaption>${caption}</figcaption>` : ''}\n</figure>`);
+      }
     }
   }
 
@@ -2427,6 +2549,9 @@ async function buildPostHTML(){
   figure.inline-figure{ margin:32px auto; }
   figure.inline-figure img{ display:block; width:100%; border:1.5px solid var(--ink); }
   figure.inline-figure figcaption{ font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:var(--graphite); padding:8px 2px 0; }
+  figure.video-figure{ margin:32px auto; }
+  figure.video-figure video{ display:block; width:100%; border:1.5px solid var(--ink); background:#000; }
+  figure.video-figure figcaption{ font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:var(--graphite); padding:8px 2px 0; }
   .code-lang{ font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--stamp); margin:28px 0 6px; }
   pre{ background:var(--ink); color:#E8EAE3; font-family:'IBM Plex Mono',monospace; font-size:13px; line-height:1.6; padding:18px 20px; overflow:auto; margin:0 0 8px; border-radius:8px; }
   .code-desc{ font-size:14px; color:var(--graphite); margin:0 0 28px; }
@@ -2506,6 +2631,15 @@ document.getElementById('exportPostBtn').addEventListener('click', async () => {
           const mHandle = await modelsDirHandle.getFileHandle(f.name, { create: true });
           await writeToHandle(mHandle, f);
         }
+      }
+
+      // Auto-save any dropped video files into subcat/posts/videos/
+      for(const card of blockListEl.children){
+        if(card.dataset.type !== 'video') continue;
+        const store = postFileStore.get(card.id);
+        if(!store || !store.video) continue;
+        const vHandle = await videosDirHandle.getFileHandle(store.video.name, { create: true });
+        await writeToHandle(vHandle, store.video);
       }
 
       updatePostSaveStatus();
