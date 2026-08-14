@@ -408,6 +408,7 @@
           <label class="field">Hero image</label>
           <div class="dropzone" id="heroDrop" tabindex="0">Drag &amp; drop an image, or click to choose one</div>
           <input type="file" id="heroFile" accept="image/*" hidden>
+          <button class="btn" id="removeHeroBtn" type="button" style="margin-top:8px;display:none;">✕ Remove hero image</button>
           <label class="field">Hero image description (alt text)</label>
           <input type="text" id="heroAlt" placeholder="Describe the hero image">
         </fieldset>
@@ -1882,9 +1883,14 @@ function setupDropzone(zoneEl, inputEl, onFile){
 
 /* ---------- Hero dropzone ---------- */
 
-setupDropzone(document.getElementById('heroDrop'), document.getElementById('heroFile'), async (file) => {
-  postFileStore.set('__hero__', file);
-  const dataUrl = await fileToDataURL(file);
+function resetHeroDropzone(){
+  const dz = document.getElementById('heroDrop');
+  dz.innerHTML = '';
+  dz.textContent = 'Drag & drop an image, or click to choose one';
+  document.getElementById('removeHeroBtn').style.display = 'none';
+}
+
+function showHeroPreview(file, dataUrl){
   const dz = document.getElementById('heroDrop');
   dz.innerHTML = '';
   const img = document.createElement('img');
@@ -1893,6 +1899,22 @@ setupDropzone(document.getElementById('heroDrop'), document.getElementById('hero
   const label = document.createElement('div');
   label.textContent = file.name + ' — drop a different file to replace';
   dz.appendChild(label);
+  document.getElementById('removeHeroBtn').style.display = '';
+}
+
+setupDropzone(document.getElementById('heroDrop'), document.getElementById('heroFile'), async (file) => {
+  postFileStore.set('__hero__', file);
+  const dataUrl = await fileToDataURL(file);
+  showHeroPreview(file, dataUrl);
+  scheduleSave();
+});
+
+document.getElementById('removeHeroBtn').addEventListener('click', (e) => {
+  e.stopPropagation(); // don't let the click bubble to the dropzone and reopen the file picker
+  postFileStore.delete('__hero__');
+  document.getElementById('heroFile').value = '';
+  resetHeroDropzone();
+  renderPostPreview();
   scheduleSave();
 });
 
@@ -2262,6 +2284,7 @@ function clearPostEditor(){
   ['metaCategory','metaDate','metaTitle','metaDek','metaTags','metaReadTime','heroAlt','postBackLink','postRelUrl']
     .forEach(id => document.getElementById(id).value = '');
   document.getElementById('heroDrop').textContent = 'Drag & drop an image, or click to choose one';
+  document.getElementById('removeHeroBtn').style.display = 'none';
   postHtmlHandle = null;
   currentPostRow = null;
   updatePostSaveStatus();
@@ -2346,14 +2369,7 @@ async function editPost(row){
   if(cached){
     if(cached.heroFile){
       postFileStore.set('__hero__', cached.heroFile);
-      fileToDataURL(cached.heroFile).then(dataUrl => {
-        const dz = document.getElementById('heroDrop');
-        dz.innerHTML = '';
-        const img = document.createElement('img'); img.className = 'preview'; img.src = dataUrl;
-        dz.appendChild(img);
-        const label = document.createElement('div'); label.textContent = cached.heroFile.name + ' — drop a different file to replace';
-        dz.appendChild(label);
-      });
+      fileToDataURL(cached.heroFile).then(dataUrl => showHeroPreview(cached.heroFile, dataUrl));
     }
     await restoreBlocksFromSnapshot(cached.blocks);
     renderPostPreview();
