@@ -258,7 +258,7 @@
   .row-card .drag-handle{
     position: absolute; top: 5px; right: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 12px;
     color: var(--ink); background: var(--paper); border: 1px solid var(--ink); padding: 1px 7px;
-    cursor: grab; z-index: 2;
+    cursor: grab; z-index: 2; touch-action: none;
   }
   .row-card .card-body2{ padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 5px; flex: 1; }
   .row-card .title-input{
@@ -712,7 +712,6 @@ function renderRowTable(){
   l.rows.forEach((row, i) => {
     const card = document.createElement('div');
     card.className = 'row-card';
-    card.draggable = false; // only becomes draggable while the handle is actually pressed — see below
     card.dataset.index = i;
 
     const thumb = document.createElement('div');
@@ -723,9 +722,48 @@ function renderRowTable(){
     const handle = document.createElement('span');
     handle.className = 'drag-handle';
     handle.textContent = '⠿';
-    handle.addEventListener('mousedown', () => { card.draggable = true; });
-    handle.addEventListener('mouseup', () => { card.draggable = false; });
     thumb.append(dwg, handle);
+
+    // Reordering via pointer events rather than native HTML5 drag-and-drop —
+    // more reliable across browsers and works on touch too, which native
+    // drag does not support without extra polyfills.
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const fromIdx = i;
+      card.classList.add('dragging');
+      handle.setPointerCapture(e.pointerId);
+
+      function currentOverCard(clientX, clientY){
+        const el = document.elementFromPoint(clientX, clientY);
+        const found = el ? el.closest('.row-card') : null;
+        return (found && found !== card) ? found : null;
+      }
+      function onMove(e2){
+        grid.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over'));
+        const overCard = currentOverCard(e2.clientX, e2.clientY);
+        if(overCard) overCard.classList.add('drag-over');
+      }
+      function onUp(e2){
+        handle.releasePointerCapture(e2.pointerId);
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        card.classList.remove('dragging');
+        grid.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over'));
+        const overCard = currentOverCard(e2.clientX, e2.clientY);
+        if(overCard){
+          const toIdx = parseInt(overCard.dataset.index, 10);
+          if(!Number.isNaN(toIdx) && toIdx !== fromIdx){
+            const [moved] = l.rows.splice(fromIdx, 1);
+            l.rows.splice(toIdx, 0, moved);
+            renumberRows(l);
+            renderRowTable();
+            scheduleSave();
+          }
+        }
+      }
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onUp);
+    });
 
     let justRepositioned = false; // suppresses the thumb's click-to-browse right after a reposition drag
 
@@ -1041,40 +1079,6 @@ function renderRowTable(){
     body.append(title, desc, toggle, metaFields, entryActions);
     card.append(thumb, body);
     grid.appendChild(card);
-  });
-
-  // drag reorder
-  grid.addEventListener('dragstart', (e) => {
-    const card = e.target.closest('.row-card');
-    if(!card || !e.target.closest('.drag-handle')){ if(card) e.preventDefault(); return; }
-    card.classList.add('dragging');
-    e.dataTransfer.setData('text/plain', card.dataset.index);
-    e.dataTransfer.effectAllowed = 'move';
-  });
-  grid.addEventListener('dragend', (e) => {
-    const card = e.target.closest('.row-card');
-    if(card){ card.classList.remove('dragging'); card.draggable = false; }
-    grid.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over'));
-  });
-  grid.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    const card = e.target.closest('.row-card');
-    if(!card) return;
-    grid.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over'));
-    card.classList.add('drag-over');
-  });
-  grid.addEventListener('drop', (e) => {
-    e.preventDefault();
-    const targetCard = e.target.closest('.row-card');
-    const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
-    if(!targetCard || Number.isNaN(fromIdx)) return;
-    const toIdx = parseInt(targetCard.dataset.index, 10);
-    if(fromIdx === toIdx) return;
-    const [moved] = l.rows.splice(fromIdx, 1);
-    l.rows.splice(toIdx, 0, moved);
-    renumberRows(l);
-    renderRowTable();
-    scheduleSave();
   });
 
   if(l.isRoot){
